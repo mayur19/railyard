@@ -1,0 +1,3192 @@
+openapi: 3.1.0
+info:
+  title: Railyard API
+  version: 0.1.0
+  summary: Self-hosted CI/CD pipeline orchestrator.
+  description: |
+    Full target HTTP API of Railyard. Every operation carries `x-status`:
+
+    - `implemented`: served by `apps/api` today and covered by the integration suites in `apps/api/test`.
+    - `pending`: the route is registered (authenticated, authorised and CSRF-checked exactly like a real
+      route) but answers `501 NOT_IMPLEMENTED` with `error.details.ticket` set to the backlog ticket in
+      `x-ticket`. Request and success-response shapes documented for pending operations are the target
+      contract and may still change before the ticket lands.
+
+    All JSON responses use the envelope `{ data, error, meta? }`. See `docs/api/README.md` for
+    conventions, error codes, pagination, the auth/CSRF flow and curl examples.
+  license:
+    name: MIT
+    identifier: MIT
+servers:
+  - url: http://127.0.0.1:4105
+    description: Local development API (API_HOST/API_PORT defaults)
+  - url: https://ci.example.internal
+    description: Typical production deployment behind nginx (same origin as the web UI)
+tags:
+  - name: health
+  - name: auth
+  - name: projects
+  - name: pipelines
+  - name: runs
+  - name: logs
+  - name: secrets
+  - name: artifacts
+  - name: environments
+  - name: approvals
+  - name: schedules
+  - name: runners
+  - name: metrics
+  - name: organization
+  - name: audit
+  - name: tokens
+  - name: notifications
+security:
+  - sessionCookie: []
+
+paths:
+  /api/health:
+    get:
+      tags: [health]
+      operationId: getHealth
+      summary: Liveness probe
+      description: Process is up. Does not touch the database.
+      x-status: implemented
+      security: []
+      responses:
+        '200':
+          description: Process alive
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/EnvelopeOk'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/Health'
+
+  /api/ready:
+    get:
+      tags: [health]
+      operationId: getReady
+      summary: Readiness probe
+      description: |
+        Runs one query against Postgres and reports queue depth and the number of runners whose
+        `runners.last_heartbeat_at` is within the last minute. Returns 503 when the database is unreachable.
+      x-status: implemented
+      security: []
+      responses:
+        '200':
+          description: Database reachable
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/EnvelopeOk'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/Readiness'
+        '503':
+          description: Database unavailable (`error.code` = `NOT_READY`)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+
+  /api/auth/register:
+    post:
+      tags: [auth]
+      operationId: register
+      summary: Register an organization and its owner
+      description: |
+        Creates an organization, a user with role `owner`, a session, and an `auth.registered` audit
+        entry in one transaction. Rate-limited per client IP (REGISTER_RATE_LIMIT per
+        REGISTER_RATE_WINDOW_SECONDS); the limiter is consulted before validation, so malformed attempts
+        count too. "Email already registered" and "organization slug taken" both produce the same
+        generic 409 so the endpoint cannot be used to enumerate accounts. Email-verified signup with a
+        uniform 202 is planned in RY-150.
+      x-status: implemented
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegisterRequest'
+      responses:
+        '201':
+          description: Organization, owner and session created
+          headers:
+            Set-Cookie:
+              $ref: '#/components/headers/SessionCookies'
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/EnvelopeOk'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/Principal'
+        '400':
+          $ref: '#/components/responses/ValidationFailed'
+        '409':
+          description: Generic rejection; identical for duplicate email and duplicate slug
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+              example:
+                data: null
+                error:
+                  code: CONFLICT
+                  message: Registration could not be completed with the supplied details
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /api/auth/login:
+    post:
+      tags: [auth]
+      operationId: login
+      summary: Log in with email and password
+      description: |
+        Three throttles apply, in this order, after body validation and before the password is verified.
+        All decisions are taken synchronously before the first await. Keys use the normalised client IP
+        (IPv4-mapped IPv6 becomes IPv4; other IPv6 collapses to its /64).
+
+        1. Per client IP, fixed window: at most LOGIN_IP_RATE_LIMIT attempts (successful or not) per
+           LOGIN_RATE_WINDOW_SECONDS. Stops password spraying across many accounts from one address.
+        2. Distinct emails per client IP: at most LOGIN_MAX_EMAILS_PER_IP different emails per
+           LOGIN_RATE_WINDOW_SECONDS. Stops account cycling and flooding of the per-email store.
+        3. Per normalised email, progressive backoff: each attempt is reserved (counted as a failure) up
+           front and reset on success. The first LOGIN_EMAIL_FREE_ATTEMPTS failures are free, then each
+           further failure locks the email for LOGIN_BACKOFF_BASE_SECONDS x 2^(n-1), capped at
+           LOGIN_BACKOFF_MAX_SECONDS. Stops credential stuffing against one account from many IPs.
+
+        Unknown users and wrong passwords both return `401 INVALID_CREDENTIALS`, and scrypt runs against
+        a dummy hash for unknown users so timing does not reveal account existence.
+      x-status: implemented
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+            example:
+              email: owner@railyard.local
+              password: railyard-demo-pass
+      responses:
+        '200':
+          description: Session created
+          headers:
+            Set-Cookie:
+              $ref: '#/components/headers/SessionCookies'
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/EnvelopeOk'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/Principal'
+        '400':
+          $ref: '#/components/responses/ValidationFailed'
+        '401':
+          description: Wrong email or password (`INVALID_CREDENTIALS`)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+              example:
+                data: null
+                error:
+                  code: INVALID_CREDENTIALS
+                  message: Email or password is incorrect
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /api/auth/logout:
+    post:
+      tags: [auth]
+      operationId: logout
+      summary: End the current session
+      description: Deletes the session row, writes `auth.logout` to the audit log and clears both cookies.
+      x-status: implemented
+      security:
+        - sessionCookie: []
+          csrfHeader: []
+      responses:
+        '204':
+          description: Logged out (no body)
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /api/auth/me:
+    get:
+      tags: [auth]
+      operationId: getMe
+      summary: Current principal
+      description: Returns the user, organization, role and the CSRF token bound to the session.
+      x-status: implemented
+      responses:
+        '200':
+          description: Current principal
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/EnvelopeOk'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/Principal'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+
+  /api/projects:
+    get:
+      tags: [projects]
+      operationId: listProjects
+      summary: List projects of the caller's organization
+      description: Ordered by name. Each project carries a summary of its most recent run.
+      x-status: implemented
+      x-permission: project:read
+      responses:
+        '200':
+          description: Projects
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/EnvelopeOk'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/Project'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+    post:
+      tags: [projects]
+      operationId: createProject
+      summary: Create a project
+      description: Writes a `project.created` audit entry. Slugs are unique per organization.
+      x-status: implemented
+      x-permission: project:write
+      security:
+        - sessionCookie: []
+          csrfHeader: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateProjectRequest'
+      responses:
+        '201':
+          description: Project created
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/EnvelopeOk'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/Project'
+        '400':
+          $ref: '#/components/responses/ValidationFailed'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /api/projects/{id}:
+    parameters:
+      - $ref: '#/components/parameters/ProjectId'
+    get:
+      tags: [projects]
+      operationId: getProject
+      summary: Get one project
+      x-status: implemented
+      x-permission: project:read
+      responses:
+        '200':
+          description: Project
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/EnvelopeOk'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/Project'
+        '400':
+          $ref: '#/components/responses/ValidationFailed'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    patch:
+      tags: [projects]
+      operationId: updateProject
+      summary: Update project settings
+      x-status: pending
+      x-ticket: RY-011
+      x-permission: project:write
+      security:
+        - sessionCookie: []
+          csrfHeader: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateProjectRequest'
+      responses:
+        '200':
+          description: Target response once RY-011 lands
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/EnvelopeOk'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/Project'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+    delete:
+      tags: [projects]
+      operationId: deleteProject
+      summary: Archive or delete a project
+      description: Target behaviour archives by default; `?purge=true` deletes runs, logs and artifacts.
+      x-status: pending
+      x-ticket: RY-011
+      x-permission: project:write
+      security:
+        - sessionCookie: []
+          csrfHeader: []
+      parameters:
+        - name: purge
+          in: query
+          required: false
+          schema:
+            type: boolean
+            default: false
+      responses:
+        '204':
+          description: Target response once RY-011 lands
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+
+  /api/projects/{id}/sync:
+    parameters:
+      - $ref: '#/components/parameters/ProjectId'
+    post:
+      tags: [projects]
+      operationId: syncProject
+      summary: Poll the bare repository now
+      x-status: pending
+      x-ticket: RY-012
+      x-permission: project:write
+      security:
+        - sessionCookie: []
+          csrfHeader: []
+      responses:
+        '202':
+          description: Target response once RY-012 lands; returns the refs that changed
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/EnvelopeOk'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          changedRefs:
+                            type: array
+                            items:
+                              type: string
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+
+  /api/projects/{id}/branches:
+    parameters:
+      - $ref: '#/components/parameters/ProjectId'
+    get:
+      tags: [projects]
+      operationId: listBranches
+      summary: List branches and head commits
+      x-status: pending
+      x-ticket: RY-013
+      x-permission: project:read
+      responses:
+        '200':
+          description: Target response once RY-013 lands
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/EnvelopeOk'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/Branch'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+
+  /api/projects/{id}/commits:
+    parameters:
+      - $ref: '#/components/parameters/ProjectId'
+    get:
+      tags: [projects]
+      operationId: listCommits
+      summary: List commits for a branch
+      x-status: pending
+      x-ticket: RY-013
+      x-permission: project:read
+      parameters:
+        - name: branch
+          in: query
+          required: true
+          schema:
+            type: string
+        - $ref: '#/components/parameters/Limit'
+        - name: cursor
+          in: query
+          required: false
+          schema:
+            type: string
+            description: Commit SHA to continue after
+      responses:
+        '200':
+          description: Target response once RY-013 lands
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/EnvelopeOk'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/Commit'
+                      meta:
+                        $ref: '#/components/schemas/CursorMeta'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+
+  /api/projects/{id}/pipeline-file:
+    parameters:
+      - $ref: '#/components/parameters/ProjectId'
+    get:
+      tags: [projects]
+      operationId: getPipelineFile
+      summary: Read .railyard.yml at a commit
+      x-status: pending
+      x-ticket: RY-014
+      x-permission: project:read
+      parameters:
+        - name: ref
+          in: query
+          required: false
+          description: Branch name or commit SHA; defaults to the project's default branch.
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Target response once RY-014 lands
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/EnvelopeOk'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/PipelineFile'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+
+  /api/pipelines/validate:
+    post:
+      tags: [pipelines]
+      operationId: validatePipeline
+      summary: Validate a pipeline definition and preview its execution plan
+      description: |
+        Side-effect free: parses the YAML, runs the schema validator, and when valid compiles an
+        execution plan for the supplied context (branch, sha, event) with `run_number` = 0.
+        Always answers 200 for well-formed requests; `data.valid` tells whether the pipeline is usable.
+        Issues carry a JSON-path style `path` and, when known, `line` and `column`. Plans that exceed
+        the planned-job limit (1000) are returned as invalid with code `plan_too_large`.
+        Being a POST, it still requires the CSRF header.
+      x-status: implemented
+      x-permission: pipeline:validate
+      security:
+        - sessionCookie: []
+          csrfHeader: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ValidatePipelineRequest'
+      responses:
+        '200':
+          description: Validation result
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/EnvelopeOk'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/PlanPreview'
+        '400':
+          $ref: '#/components/responses/ValidationFailed'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+
+  /api/projects/{id}/runs:
+    parameters:
+      - $ref: '#/components/parameters/ProjectId'
+    post:
+      tags: [runs]
+      operationId: createRun
+      summary: Start a run from a pipeline definition
+      description: |
+        In one transaction: reserves the next run number (row lock on the project serialises concurrent
+        requests), validates and plans the YAML, inserts the run, its jobs and steps, writes a
+        `run.created` audit entry and issues a `railyard_jobs` NOTIFY. Jobs without dependencies start
+        `queued`; all others start `blocked`.
+      x-status: implemented
+      x-permission: run:create
+      security:
+        - sessionCookie: []
+          csrfHeader: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateRunRequest'
+      responses:
+        '201':
+          description: Run created
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/EnvelopeOk'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/RunDetail'
+        '400':
+          $ref: '#/components/responses/ValidationFailed'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '422':
+          description: |
+            `PIPELINE_INVALID` (details.issues holds PipelineIssue[]) or `EMPTY_PLAN` (no job survives
+            conditions for this branch/event; details.excluded holds ExcludedJob[]).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+              examples:
+                invalid:
+                  value:
+                    data: null
+                    error:
+                      code: PIPELINE_INVALID
+                      message: Pipeline definition is invalid
+                      details:
+                        issues:
+                          - severity: error
+                            code: unknown_job
+                            path: jobs.test.needs[0]
+                            message: "needs references unknown job 'buld'"
+                            line: 9
+                            column: 13
+                empty:
+                  value:
+                    data: null
+                    error:
+                      code: EMPTY_PLAN
+                      message: No jobs match this branch and event
+                      details:
+                        excluded:
+                          - jobId: deploy
+                            reason: "condition false: branch == 'main'"
+    get:
+      tags: [runs]
+      operationId: listRuns
+      summary: List runs of a project (newest first, cursor paginated)
+      description: |
+        Keyset pagination on the run number. `meta.nextCursor` is the number of the last run on the page
+        (as a string) or null on the last page; pass it back as `cursor` to fetch older runs.
+      x-status: implemented
+      x-permission: run:read
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - name: cursor
+          in: query
+          required: false
+          description: Return runs with a number strictly lower than this value.
+          schema:
+            type: integer
+            minimum: 1
+      responses:
+        '200':
+          description: One page of runs
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/EnvelopeOk'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/RunSummary'
+                      meta:
+                        $ref: '#/components/schemas/CursorMeta'
+        '400':
+          $ref: '#/components/responses/ValidationFailed'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/runs/{id}:
+    parameters:
+      - $ref: '#/components/parameters/RunId'
+    get:
+      tags: [runs]
+      operationId: getRun
+      summary: Run detail with jobs, steps, stages and critical path
+      x-status: implemented
+      x-permission: run:read
+      responses:
+        '200':
+          description: Run detail
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/EnvelopeOk'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/RunDetail'
+        '400':
+          $ref: '#/components/responses/ValidationFailed'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/runs/{id}/cancel:
+    parameters:
+      - $ref: '#/components/parameters/RunId'
+    post:
+      tags: [runs]
+      operationId: cancelRun
+      summary: Cancel a run
+      x-status: pending
+      x-ticket: RY-043
+      x-permission: run:cancel
+      security:
+        - sessionCookie: []
+          csrfHeader: []
+      responses:
+        '202':
+          description: Target response once RY-043 lands; running jobs are signalled, blocked/queued jobs cancelled
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/EnvelopeOk'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/RunDetail'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+
+  /api/runs/{id}/rerun:
+    parameters:
+      - $ref: '#/components/parameters/RunId'
+    post:
+      tags: [runs]
+      operationId: rerunPipeline
+      summary: Re-run a pipeline with the same inputs
+      x-status: pending
+      x-ticket: RY-044
+      x-permission: run:create
+      security:
+        - sessionCookie: []
+          csrfHeader: []
+      responses:
+        '201':
+          description: Target response once RY-044 lands; a new run with the same YAML, branch, sha and event
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/EnvelopeOk'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/RunDetail'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+
+  /api/runs/{id}/jobs/{jobId}/cancel:
+    parameters:
+      - $ref: '#/components/parameters/RunId'
+      - $ref: '#/components/parameters/JobId'
+    post:
+      tags: [runs]
+      operationId: cancelJob
+      summary: Cancel one job
+      x-status: pending
+      x-ticket: RY-043
+      x-permission: run:cancel
+      security:
+        - sessionCookie: []
+          csrfHeader: []
+      responses:
+        '202':
+          description: Target response once RY-043 lands
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/EnvelopeOk'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/Job'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+
+  /api/runs/{id}/jobs/{jobId}/retry:
+    parameters:
+      - $ref: '#/components/parameters/RunId'
+      - $ref: '#/components/parameters/JobId'
+    post:
+      tags: [runs]
+      operationId: retryJob
+      summary: Retry a failed job
+      x-status: pending
+      x-ticket: RY-044
+      x-permission: run:create
+      security:
+        - sessionCookie: []
+          csrfHeader: []
+      responses:
+        '202':
+          description: Target response once RY-044 lands; the job is requeued and skipped dependents re-blocked
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/EnvelopeOk'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/Job'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+
+  /api/runs/{id}/jobs/{jobId}/logs:
+    parameters:
+      - $ref: '#/components/parameters/RunId'
+      - $ref: '#/components/parameters/JobId'
+    get:
+      tags: [logs]
+      operationId: getJobLogs
+      summary: Fetch persisted log chunks after a sequence number
+      description: |
+        Chunks are ordered by `seq` (strictly increasing per job, continuous across retry attempts).
+        Poll with `after=meta.lastSeq` until `meta.complete` is true. `complete` is true only when the
+        job is terminal and fewer than `limit` chunks were returned.
+      x-status: implemented
+      x-permission: run:read
+      parameters:
+        - name: after
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 5000
+            default: 1000
+      responses:
+        '200':
+          description: Log chunks
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/EnvelopeOk'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/LogChunk'
+                      meta:
+                        $ref: '#/components/schemas/LogMeta'
+        '400':
+          $ref: '#/components/responses/ValidationFailed'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/runs/{id}/jobs/{jobId}/logs/stream:
+    parameters:
+      - $ref: '#/components/parameters/RunId'
+      - $ref: '#/components/parameters/JobId'
+    get:
+      tags: [logs]
+      operationId: streamJobLogs
+      summary: Live log stream (Server-Sent Events)
+      description: |
+        `text/event-stream`. The server first sends `retry: 2000`, then back-fills every chunk with
+        `seq > resume point`, then streams new chunks as `railyard_logs` notifications arrive. Events:
+
+        - `event: log`, `id: <seq>`, `data: {"seq":N,"stream":"stdout|stderr|system","content":"..."}`
+        - `event: status`, `data: {"status":"<JobStatus>"}`; sent once at connect and on every job transition
+        - `event: end`, `data: {}`; sent after a terminal status, then the server closes the stream
+
+        A comment line `: keep-alive` is written every 15 s. Resume point: the `Last-Event-ID` header
+        (set automatically by EventSource on reconnect) wins over the `after` query parameter.
+        Authentication and tenant checks happen before the stream opens, so failures are ordinary JSON
+        error envelopes.
+      x-status: implemented
+      x-permission: run:read
+      parameters:
+        - name: after
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
+        - name: Last-Event-ID
+          in: header
+          required: false
+          description: Sequence number of the last `log` event received.
+          schema:
+            type: integer
+            minimum: 1
+      responses:
+        '200':
+          description: Event stream
+          headers:
+            X-Accel-Buffering:
+              description: Always `no`, so nginx does not buffer the stream.
+              schema:
+                type: string
+          content:
+            text/event-stream:
+              schema:
+                type: string
+              example: |
+                retry: 2000
+
+                event: log
+                id: 1
+                data: {"seq":1,"stream":"system","content":"[railyard] compile - attempt 1 on runner-a\n"}
+
+                event: status
+                data: {"status":"running"}
+
+                event: log
+                id: 2
+                data: {"seq":2,"stream":"stdout","content":"bundle chunk 1\n"}
+
+                event: status
+                data: {"status":"succeeded"}
+
+                event: end
+                data: {}
+        '400':
+          $ref: '#/components/responses/ValidationFailed'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/runs/{id}/jobs/{jobId}/logs/raw:
+    parameters:
+      - $ref: '#/components/parameters/RunId'
+      - $ref: '#/components/parameters/JobId'
+    get:
+      tags: [logs]
+      operationId: downloadRawLog
+      summary: Download raw job log
+      x-status: pending
+      x-ticket: RY-065
+      x-permission: run:read
+      responses:
+        '200':
+          description: Target response once RY-065 lands
+          content:
+            text/plain:
+              schema:
+                type: string
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+
+  /api/projects/{id}/secrets:
+    parameters:
+      - $ref: '#/components/parameters/ProjectId'
+    get:
+      tags: [secrets]
+      operationId: listSecrets
+      summary: List secret names (never values)
+      x-status: pending
+      x-ticket: RY-071
+      x-permission: project:read
+      responses:
+        '200':
+          description: Target response once RY-071 lands
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/EnvelopeOk'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/SecretMetadata'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+
+  /api/projects/{id}/secrets/{name}:
+    parameters:
+      - $ref: '#/components/parameters/ProjectId'
+      - $ref: '#/components/parameters/SecretName'
+    put:
+      tags: [secrets]
+      operationId: putSecret
+      summary: Create or replace a secret (write-only)
+      x-status: pending
+      x-ticket: RY-071
+      x-permission: secret:write
+      security:
+        - sessionCookie: []
+          csrfHeader: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PutSecretRequest'
+      responses:
+        '200':
+          description: Target response once RY-071 lands; the value is never echoed
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/EnvelopeOk'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/SecretMetadata'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+    delete:
+      tags: [secrets]
+      operationId: deleteSecret
+      summary: Delete a secret
+      x-status: pending
+      x-ticket: RY-071
+      x-permission: secret:write
+      security:
+        - sessionCookie: []
+          csrfHeader: []
+      responses:
+        '204':
+          description: Target response once RY-071 lands
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+
+  /api/runs/{id}/artifacts:
+    parameters:
+      - $ref: '#/components/parameters/RunId'
+    get:
+      tags: [artifacts]
+      operationId: listRunArtifacts
+      summary: List run artifacts
+      x-status: pending
+      x-ticket: RY-081
+      x-permission: run:read
+      responses:
+        '200':
+          description: Target response once RY-081 lands
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/EnvelopeOk'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/Artifact'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+
+  /api/artifacts/{id}/download:
+    parameters:
+      - $ref: '#/components/parameters/ArtifactId'
+    get:
+      tags: [artifacts]
+      operationId: downloadArtifact
+      summary: Download an artifact
+      x-status: pending
+      x-ticket: RY-081
+      x-permission: run:read
+      responses:
+        '200':
+          description: Target response once RY-081 lands (tar.gz stream)
+          content:
+            application/gzip:
+              schema:
+                type: string
+                contentEncoding: binary
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+
+  /api/projects/{id}/caches:
+    parameters:
+      - $ref: '#/components/parameters/ProjectId'
+    delete:
+      tags: [artifacts]
+      operationId: purgeCaches
+      summary: Purge project caches
+      x-status: pending
+      x-ticket: RY-084
+      x-permission: project:write
+      security:
+        - sessionCookie: []
+          csrfHeader: []
+      responses:
+        '204':
+          description: Target response once RY-084 lands
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+
+  /api/projects/{id}/environments:
+    parameters:
+      - $ref: '#/components/parameters/ProjectId'
+    get:
+      tags: [environments]
+      operationId: listEnvironments
+      summary: List deployment environments
+      x-status: pending
+      x-ticket: RY-090
+      x-permission: project:read
+      responses:
+        '200':
+          description: Target response once RY-090 lands
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/EnvelopeOk'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/Environment'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+    post:
+      tags: [environments]
+      operationId: createEnvironment
+      summary: Create a deployment environment
+      x-status: pending
+      x-ticket: RY-090
+      x-permission: project:write
+      security:
+        - sessionCookie: []
+          csrfHeader: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateEnvironmentRequest'
+      responses:
+        '201':
+          description: Target response once RY-090 lands
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/EnvelopeOk'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/Environment'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+
+  /api/projects/{id}/deployments:
+    parameters:
+      - $ref: '#/components/parameters/ProjectId'
+    get:
+      tags: [environments]
+      operationId: listDeployments
+      summary: Deployment history
+      x-status: pending
+      x-ticket: RY-090
+      x-permission: project:read
+      parameters:
+        - name: environment
+          in: query
+          required: false
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Target response once RY-090 lands
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/EnvelopeOk'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/Deployment'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+
+  /api/approvals:
+    get:
+      tags: [approvals]
+      operationId: listApprovals
+      summary: Pending approvals for the current user
+      x-status: pending
+      x-ticket: RY-091
+      x-permission: run:read
+      responses:
+        '200':
+          description: Target response once RY-091 lands
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/EnvelopeOk'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/Approval'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+
+  /api/approvals/{id}/approve:
+    parameters:
+      - $ref: '#/components/parameters/ApprovalId'
+    post:
+      tags: [approvals]
+      operationId: approveJob
+      summary: Approve a gated job
+      x-status: pending
+      x-ticket: RY-091
+      x-permission: run:create
+      security:
+        - sessionCookie: []
+          csrfHeader: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ApprovalDecisionRequest'
+      responses:
+        '200':
+          description: Target response once RY-091 lands
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/EnvelopeOk'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/Approval'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+
+  /api/approvals/{id}/reject:
+    parameters:
+      - $ref: '#/components/parameters/ApprovalId'
+    post:
+      tags: [approvals]
+      operationId: rejectJob
+      summary: Reject a gated job
+      x-status: pending
+      x-ticket: RY-091
+      x-permission: run:create
+      security:
+        - sessionCookie: []
+          csrfHeader: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ApprovalDecisionRequest'
+      responses:
+        '200':
+          description: Target response once RY-091 lands
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/EnvelopeOk'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/Approval'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+
+  /api/projects/{id}/schedules:
+    parameters:
+      - $ref: '#/components/parameters/ProjectId'
+    get:
+      tags: [schedules]
+      operationId: listSchedules
+      summary: List schedules with next fire time
+      x-status: pending
+      x-ticket: RY-101
+      x-permission: project:read
+      responses:
+        '200':
+          description: Target response once RY-101 lands
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/EnvelopeOk'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/Schedule'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+    post:
+      tags: [schedules]
+      operationId: createSchedule
+      summary: Create a schedule
+      x-status: pending
+      x-ticket: RY-101
+      x-permission: project:write
+      security:
+        - sessionCookie: []
+          csrfHeader: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateScheduleRequest'
+      responses:
+        '201':
+          description: Target response once RY-101 lands
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/EnvelopeOk'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/Schedule'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+
+  /api/schedules/{id}:
+    parameters:
+      - $ref: '#/components/parameters/ScheduleId'
+    delete:
+      tags: [schedules]
+      operationId: deleteSchedule
+      summary: Delete a schedule
+      x-status: pending
+      x-ticket: RY-101
+      x-permission: project:write
+      security:
+        - sessionCookie: []
+          csrfHeader: []
+      responses:
+        '204':
+          description: Target response once RY-101 lands
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+
+  /api/runners:
+    get:
+      tags: [runners]
+      operationId: listRunners
+      summary: List runners and their health
+      x-status: pending
+      x-ticket: RY-053
+      x-permission: runner:manage
+      responses:
+        '200':
+          description: Target response once RY-053 lands
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/EnvelopeOk'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/Runner'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+
+  /api/runners/registration-tokens:
+    post:
+      tags: [runners]
+      operationId: createRunnerRegistrationToken
+      summary: Issue a runner registration token
+      x-status: pending
+      x-ticket: RY-053
+      x-permission: runner:manage
+      security:
+        - sessionCookie: []
+          csrfHeader: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                labels:
+                  type: array
+                  items:
+                    type: string
+                expiresInHours:
+                  type: integer
+                  minimum: 1
+                  maximum: 168
+                  default: 24
+      responses:
+        '201':
+          description: Target response once RY-053 lands; the token is shown exactly once
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/EnvelopeOk'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/RegistrationToken'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+
+  /api/runners/{id}:
+    parameters:
+      - $ref: '#/components/parameters/RunnerId'
+    delete:
+      tags: [runners]
+      operationId: deleteRunner
+      summary: Deregister a runner
+      x-status: pending
+      x-ticket: RY-053
+      x-permission: runner:manage
+      security:
+        - sessionCookie: []
+          csrfHeader: []
+      responses:
+        '204':
+          description: Target response once RY-053 lands
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+
+  /api/metrics/queue:
+    get:
+      tags: [metrics]
+      operationId: getQueueMetrics
+      summary: Queue depth and wait-time percentiles
+      x-status: pending
+      x-ticket: RY-110
+      x-permission: run:read
+      parameters:
+        - $ref: '#/components/parameters/Window'
+      responses:
+        '200':
+          description: Target response once RY-110 lands
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/EnvelopeOk'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/QueueMetrics'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+
+  /api/projects/{id}/metrics:
+    parameters:
+      - $ref: '#/components/parameters/ProjectId'
+    get:
+      tags: [metrics]
+      operationId: getProjectMetrics
+      summary: Duration percentiles and success rate
+      x-status: pending
+      x-ticket: RY-110
+      x-permission: run:read
+      parameters:
+        - $ref: '#/components/parameters/Window'
+      responses:
+        '200':
+          description: Target response once RY-110 lands
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/EnvelopeOk'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/ProjectMetrics'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+
+  /api/org/members:
+    get:
+      tags: [organization]
+      operationId: listMembers
+      summary: List organization members
+      x-status: pending
+      x-ticket: RY-025
+      x-permission: org:manage
+      responses:
+        '200':
+          description: Target response once RY-025 lands
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/EnvelopeOk'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/Member'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+
+  /api/org/invitations:
+    post:
+      tags: [organization]
+      operationId: inviteMember
+      summary: Invite a member
+      description: Target behaviour writes the invitation email to the local outbox; no external mail provider.
+      x-status: pending
+      x-ticket: RY-024
+      x-permission: org:manage
+      security:
+        - sessionCookie: []
+          csrfHeader: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/InvitationRequest'
+      responses:
+        '202':
+          description: Target response once RY-024 lands
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/EnvelopeOk'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/Invitation'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+
+  /api/org/members/{userId}:
+    parameters:
+      - $ref: '#/components/parameters/UserId'
+    patch:
+      tags: [organization]
+      operationId: changeMemberRole
+      summary: Change member role
+      x-status: pending
+      x-ticket: RY-025
+      x-permission: org:manage
+      security:
+        - sessionCookie: []
+          csrfHeader: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [role]
+              properties:
+                role:
+                  $ref: '#/components/schemas/Role'
+      responses:
+        '200':
+          description: Target response once RY-025 lands
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/EnvelopeOk'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/Member'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+
+  /api/audit-logs:
+    get:
+      tags: [audit]
+      operationId: listAuditLogs
+      summary: Query the audit log
+      x-status: pending
+      x-ticket: RY-026
+      x-permission: audit:read
+      parameters:
+        - name: action
+          in: query
+          required: false
+          schema:
+            type: string
+            examples: [auth.login_failed]
+        - name: actorUserId
+          in: query
+          required: false
+          schema:
+            type: string
+            format: uuid
+        - $ref: '#/components/parameters/Limit'
+        - name: cursor
+          in: query
+          required: false
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Target response once RY-026 lands
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/EnvelopeOk'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/AuditLogEntry'
+                      meta:
+                        $ref: '#/components/schemas/CursorMeta'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+
+  /api/tokens:
+    get:
+      tags: [tokens]
+      operationId: listApiTokens
+      summary: List personal API tokens
+      x-status: pending
+      x-ticket: RY-028
+      x-permission: project:read
+      responses:
+        '200':
+          description: Target response once RY-028 lands
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/EnvelopeOk'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/ApiToken'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+    post:
+      tags: [tokens]
+      operationId: createApiToken
+      summary: Create a personal API token
+      x-status: pending
+      x-ticket: RY-028
+      x-permission: project:read
+      security:
+        - sessionCookie: []
+          csrfHeader: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateApiTokenRequest'
+      responses:
+        '201':
+          description: Target response once RY-028 lands; the secret is returned exactly once
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/EnvelopeOk'
+                  - type: object
+                    properties:
+                      data:
+                        allOf:
+                          - $ref: '#/components/schemas/ApiToken'
+                          - type: object
+                            properties:
+                              token:
+                                type: string
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+
+  /api/notifications:
+    get:
+      tags: [notifications]
+      operationId: listNotifications
+      summary: In-app notifications
+      x-status: pending
+      x-ticket: RY-130
+      x-permission: project:read
+      responses:
+        '200':
+          description: Target response once RY-130 lands
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/EnvelopeOk'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/Notification'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+
+components:
+  securitySchemes:
+    sessionCookie:
+      type: apiKey
+      in: cookie
+      name: ry_session
+      description: |
+        Opaque 256-bit random token set as an HttpOnly, SameSite=Lax cookie (Secure when
+        COOKIE_SECURE=true). The database stores only HMAC-SHA256(SESSION_SECRET, token) as the session id.
+        Lifetime SESSION_TTL_HOURS (default 168).
+    csrfHeader:
+      type: apiKey
+      in: header
+      name: x-csrf-token
+      description: |
+        Required on every authenticated POST, PUT, PATCH and DELETE. Must equal the CSRF token bound to
+        the session, which is returned as `data.csrfToken` by register, login and `GET /api/auth/me`, and
+        mirrored in the non-HttpOnly `ry_csrf` cookie.
+
+  headers:
+    SessionCookies:
+      description: |
+        Two cookies, both `Path=/; SameSite=Lax` with the session expiry: `ry_session=<token>; HttpOnly`
+        and `ry_csrf=<csrf token>` (readable by the web app).
+      schema:
+        type: string
+    RetryAfter:
+      description: Seconds until another attempt is allowed.
+      schema:
+        type: integer
+
+  parameters:
+    ProjectId:
+      name: id
+      in: path
+      required: true
+      description: Project id
+      schema:
+        type: string
+        format: uuid
+    RunId:
+      name: id
+      in: path
+      required: true
+      description: Run id
+      schema:
+        type: string
+        format: uuid
+    JobId:
+      name: jobId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    ArtifactId:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    ApprovalId:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    ScheduleId:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    RunnerId:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    UserId:
+      name: userId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    SecretName:
+      name: name
+      in: path
+      required: true
+      schema:
+        type: string
+        pattern: '^[A-Za-z_][A-Za-z0-9_]{0,127}$'
+    Limit:
+      name: limit
+      in: query
+      required: false
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 25
+    Window:
+      name: window
+      in: query
+      required: false
+      description: Aggregation window
+      schema:
+        type: string
+        enum: [1h, 24h, 7d, 30d]
+        default: 24h
+
+  responses:
+    ValidationFailed:
+      description: |
+        `VALIDATION_FAILED` (zod) with `details` = list of `{path, message}`; or `BAD_REQUEST` for
+        malformed JSON and other framework-level request errors.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+          example:
+            data: null
+            error:
+              code: VALIDATION_FAILED
+              message: Request validation failed
+              details:
+                - path: password
+                  message: password must be at least 12 characters
+    Unauthenticated:
+      description: No session cookie, or the session is unknown, expired or belongs to a disabled user.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+          example:
+            data: null
+            error:
+              code: UNAUTHENTICATED
+              message: Authentication required
+    Forbidden:
+      description: |
+        `FORBIDDEN` when the role lacks the permission in `x-permission`, or `CSRF_FAILED` when a
+        mutating request has a missing or wrong `x-csrf-token`. CSRF is checked before the permission.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+          examples:
+            forbidden:
+              value:
+                data: null
+                error:
+                  code: FORBIDDEN
+                  message: You do not have permission to perform this action
+            csrf:
+              value:
+                data: null
+                error:
+                  code: CSRF_FAILED
+                  message: Missing or invalid CSRF token
+    NotFound:
+      description: Resource does not exist or belongs to another organization (indistinguishable by design).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+          example:
+            data: null
+            error:
+              code: NOT_FOUND
+              message: Project not found
+    Conflict:
+      description: Uniqueness violation, e.g. duplicate project slug within the organization.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+          example:
+            data: null
+            error:
+              code: CONFLICT
+              message: "Project slug 'storefront' is already in use"
+    PayloadTooLarge:
+      description: Request body above the 512 KiB limit.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+          example:
+            data: null
+            error:
+              code: PAYLOAD_TOO_LARGE
+              message: Request body is too large
+    RateLimited:
+      description: Throttled. `Retry-After` and `details.retryAfterSeconds` carry the wait.
+      headers:
+        Retry-After:
+          $ref: '#/components/headers/RetryAfter'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+          example:
+            data: null
+            error:
+              code: RATE_LIMITED
+              message: Too many attempts, try again later
+              details:
+                retryAfterSeconds: 60
+    NotImplemented:
+      description: Planned operation, not implemented yet. `details.ticket` names the backlog ticket.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/NotImplementedEnvelope'
+          example:
+            data: null
+            error:
+              code: NOT_IMPLEMENTED
+              message: Cancel a run is planned but not implemented yet
+              details:
+                ticket: RY-043
+
+  schemas:
+    EnvelopeOk:
+      type: object
+      required: [data, error]
+      properties:
+        data:
+          description: Operation payload
+        error:
+          type: 'null'
+        meta:
+          type: object
+          additionalProperties: true
+    ErrorEnvelope:
+      type: object
+      required: [data, error]
+      properties:
+        data:
+          type: 'null'
+        error:
+          $ref: '#/components/schemas/Error'
+    NotImplementedEnvelope:
+      type: object
+      required: [data, error]
+      properties:
+        data:
+          type: 'null'
+        error:
+          type: object
+          required: [code, message, details]
+          properties:
+            code:
+              const: NOT_IMPLEMENTED
+            message:
+              type: string
+            details:
+              type: object
+              required: [ticket]
+              properties:
+                ticket:
+                  type: string
+                  pattern: '^RY-\d{3}$'
+    Error:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          $ref: '#/components/schemas/ErrorCode'
+        message:
+          type: string
+          description: Human-readable, safe to show to users; never contains secrets or stack traces.
+        details:
+          description: Code-specific structured detail (field errors, issues, retryAfterSeconds, ticket).
+    ErrorCode:
+      type: string
+      enum:
+        - BAD_REQUEST
+        - VALIDATION_FAILED
+        - UNAUTHENTICATED
+        - INVALID_CREDENTIALS
+        - FORBIDDEN
+        - CSRF_FAILED
+        - NOT_FOUND
+        - CONFLICT
+        - PAYLOAD_TOO_LARGE
+        - PIPELINE_INVALID
+        - EMPTY_PLAN
+        - RATE_LIMITED
+        - INTERNAL
+        - NOT_IMPLEMENTED
+        - NOT_READY
+    CursorMeta:
+      type: object
+      required: [nextCursor, limit]
+      properties:
+        nextCursor:
+          type: [string, 'null']
+          description: Opaque cursor for the next (older) page; null on the last page.
+        limit:
+          type: integer
+    LogMeta:
+      type: object
+      required: [lastSeq, jobStatus, complete]
+      properties:
+        lastSeq:
+          type: integer
+          description: Highest seq returned, or the `after` value when no chunk was returned.
+        jobStatus:
+          $ref: '#/components/schemas/JobStatus'
+        complete:
+          type: boolean
+
+    Health:
+      type: object
+      required: [status, version, uptimeSeconds]
+      properties:
+        status:
+          const: ok
+        version:
+          type: string
+          examples: ['0.1.0']
+        uptimeSeconds:
+          type: integer
+    Readiness:
+      type: object
+      required: [status, database, queuedJobs, onlineRunners]
+      properties:
+        status:
+          const: ready
+        database:
+          const: up
+        queuedJobs:
+          type: integer
+          description: Jobs in status `queued` across all organizations.
+        onlineRunners:
+          type: integer
+          description: Runners with `last_heartbeat_at` within the last minute.
+
+    Role:
+      type: string
+      enum: [owner, admin, developer, viewer]
+    RegisterRequest:
+      type: object
+      required: [organizationName, organizationSlug, name, email, password]
+      additionalProperties: false
+      properties:
+        organizationName:
+          type: string
+          minLength: 2
+          maxLength: 100
+        organizationSlug:
+          type: string
+          description: Trimmed and lower-cased before validation.
+          pattern: '^[a-z0-9][a-z0-9-]{1,48}[a-z0-9]$'
+        name:
+          type: string
+          minLength: 1
+          maxLength: 100
+        email:
+          type: string
+          format: email
+          maxLength: 254
+          description: Trimmed and lower-cased.
+        password:
+          type: string
+          minLength: 12
+          maxLength: 256
+    LoginRequest:
+      type: object
+      required: [email, password]
+      properties:
+        email:
+          type: string
+          format: email
+          maxLength: 254
+        password:
+          type: string
+          minLength: 1
+          maxLength: 256
+    Principal:
+      type: object
+      required: [user, organization, role, csrfToken]
+      properties:
+        user:
+          type: object
+          required: [id, email, name]
+          properties:
+            id:
+              type: string
+              format: uuid
+            email:
+              type: string
+              format: email
+            name:
+              type: string
+        organization:
+          type: object
+          required: [id, name, slug]
+          properties:
+            id:
+              type: string
+              format: uuid
+            name:
+              type: string
+            slug:
+              type: string
+        role:
+          $ref: '#/components/schemas/Role'
+        csrfToken:
+          type: string
+          description: Send as `x-csrf-token` on mutating requests.
+
+    Project:
+      type: object
+      required: [id, name, slug, repositoryPath, defaultBranch, createdAt, lastRun]
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        slug:
+          type: string
+        repositoryPath:
+          type: string
+          description: Absolute path of the bare git repository on the Railyard host.
+          examples: [/srv/git/storefront.git]
+        defaultBranch:
+          type: string
+        createdAt:
+          type: string
+          format: date-time
+        lastRun:
+          oneOf:
+            - type: 'null'
+            - type: object
+              required: [number, status, createdAt]
+              properties:
+                number:
+                  type: integer
+                status:
+                  $ref: '#/components/schemas/RunStatus'
+                createdAt:
+                  type: string
+                  format: date-time
+    CreateProjectRequest:
+      type: object
+      required: [name, slug, repositoryPath]
+      properties:
+        name:
+          type: string
+          minLength: 2
+          maxLength: 100
+        slug:
+          type: string
+          pattern: '^[a-z0-9][a-z0-9-]{1,48}[a-z0-9]$'
+        repositoryPath:
+          type: string
+          minLength: 1
+          maxLength: 1024
+          description: Must be absolute (start with `/`).
+        defaultBranch:
+          type: string
+          minLength: 1
+          maxLength: 255
+          default: main
+    UpdateProjectRequest:
+      type: object
+      minProperties: 1
+      properties:
+        name:
+          type: string
+          minLength: 2
+          maxLength: 100
+        defaultBranch:
+          type: string
+          minLength: 1
+          maxLength: 255
+        repositoryPath:
+          type: string
+          maxLength: 1024
+
+    TriggerEvent:
+      type: string
+      enum: [push, manual, schedule, api]
+    ValidatePipelineRequest:
+      type: object
+      required: [yaml]
+      properties:
+        yaml:
+          type: string
+          minLength: 1
+          maxLength: 262144
+          description: Pipeline definition (`.railyard.yml` content), at most 256 KiB.
+        context:
+          type: object
+          properties:
+            branch:
+              type: string
+              pattern: '^[A-Za-z0-9._/-]+$'
+              maxLength: 255
+              default: main
+            sha:
+              type: string
+              pattern: '^[0-9a-fA-F]{7,40}$'
+              default: '0000000'
+            event:
+              $ref: '#/components/schemas/TriggerEvent'
+    CreateRunRequest:
+      type: object
+      required: [yaml]
+      properties:
+        yaml:
+          type: string
+          minLength: 1
+          maxLength: 262144
+        branch:
+          type: string
+          pattern: '^[A-Za-z0-9._/-]+$'
+          maxLength: 255
+          default: main
+        sha:
+          type: string
+          pattern: '^[0-9a-fA-F]{7,40}$'
+          default: '0000000'
+        event:
+          type: string
+          enum: [manual, api]
+          default: manual
+    PipelineIssue:
+      type: object
+      required: [severity, code, path, message]
+      properties:
+        severity:
+          type: string
+          enum: [error, warning]
+        code:
+          type: string
+          description: |
+            Stable machine code. Current values: yaml_syntax, duplicate, unsupported_version, unknown_key,
+            required, type, enum, pattern, range, empty, too_long, too_many, unknown_stage, unknown_job,
+            self_dependency, later_stage, cycle, empty_matrix, unknown_axis, unknown_reference,
+            expression_syntax, invalid_cron, unsafe_path, plan_too_large, not_yet_executed (warning).
+        path:
+          type: string
+          description: Dotted/indexed path into the document, `$` for the root.
+          examples: ['jobs.unit.matrix.node[2]']
+        message:
+          type: string
+        line:
+          type: integer
+          minimum: 1
+        column:
+          type: integer
+          minimum: 1
+    PlanPreview:
+      type: object
+      required: [valid, issues, plan]
+      properties:
+        valid:
+          type: boolean
+        issues:
+          type: array
+          items:
+            $ref: '#/components/schemas/PipelineIssue'
+        plan:
+          oneOf:
+            - type: 'null'
+            - $ref: '#/components/schemas/ExecutionPlan'
+    ExecutionPlan:
+      type: object
+      required: [pipelineName, stages, jobs, levels, excluded, criticalPath]
+      properties:
+        pipelineName:
+          type: string
+        stages:
+          type: array
+          items:
+            type: string
+        jobs:
+          type: array
+          maxItems: 1000
+          items:
+            $ref: '#/components/schemas/PlannedJob'
+        levels:
+          type: array
+          description: Topological levels; each inner array lists job keys that may run in parallel.
+          items:
+            type: array
+            items:
+              type: string
+        excluded:
+          type: array
+          items:
+            $ref: '#/components/schemas/ExcludedJob'
+        criticalPath:
+          type: array
+          description: Job keys on the longest dependency chain.
+          items:
+            type: string
+    PlannedJob:
+      type: object
+      required:
+        [
+          key,
+          jobId,
+          name,
+          stage,
+          stageIndex,
+          matrix,
+          needs,
+          level,
+          when,
+          allowFailure,
+          timeoutSeconds,
+          retries,
+          runsOn,
+          env,
+          steps,
+        ]
+      properties:
+        key:
+          type: string
+          description: Unique within the run; matrix instances get a suffixed key.
+          examples: ['unit-node-22-shard-1']
+        jobId:
+          type: string
+          description: Job id as written in the YAML.
+        name:
+          type: string
+        stage:
+          type: string
+        stageIndex:
+          type: integer
+        matrix:
+          oneOf:
+            - type: 'null'
+            - $ref: '#/components/schemas/ScalarMap'
+        needs:
+          type: array
+          items:
+            type: string
+        level:
+          type: integer
+          minimum: 0
+        when:
+          $ref: '#/components/schemas/JobWhen'
+        allowFailure:
+          type: boolean
+        timeoutSeconds:
+          type: integer
+        retries:
+          type: integer
+          minimum: 0
+          maximum: 5
+        runsOn:
+          type: array
+          items:
+            type: string
+        env:
+          $ref: '#/components/schemas/StringMap'
+        steps:
+          type: array
+          items:
+            $ref: '#/components/schemas/PlannedStep'
+    PlannedStep:
+      type: object
+      required: [index, name, run, env, timeoutSeconds, continueOnError, workingDirectory]
+      properties:
+        index:
+          type: integer
+        name:
+          type: string
+        run:
+          type: string
+          description: Interpolated shell script.
+        env:
+          $ref: '#/components/schemas/StringMap'
+        timeoutSeconds:
+          type: integer
+        continueOnError:
+          type: boolean
+        workingDirectory:
+          type: [string, 'null']
+    ExcludedJob:
+      type: object
+      required: [jobId, reason]
+      properties:
+        jobId:
+          type: string
+        reason:
+          type: string
+    JobWhen:
+      type: string
+      enum: [on_success, on_failure, always]
+    ScalarMap:
+      type: object
+      additionalProperties:
+        type: [string, number, boolean]
+    StringMap:
+      type: object
+      additionalProperties:
+        type: string
+
+    RunStatus:
+      type: string
+      enum: [queued, running, succeeded, failed, cancelled]
+    JobStatus:
+      type: string
+      enum: [blocked, queued, running, succeeded, failed, timed_out, cancelled, skipped]
+    StepStatus:
+      type: string
+      enum: [pending, running, succeeded, failed, timed_out, skipped, cancelled]
+    RunSummary:
+      type: object
+      required:
+        [
+          id,
+          projectId,
+          number,
+          status,
+          pipelineName,
+          branch,
+          commitSha,
+          triggerEvent,
+          createdAt,
+          startedAt,
+          finishedAt,
+          jobCounts,
+        ]
+      properties:
+        id:
+          type: string
+          format: uuid
+        projectId:
+          type: string
+          format: uuid
+        number:
+          type: integer
+          minimum: 1
+        status:
+          $ref: '#/components/schemas/RunStatus'
+        pipelineName:
+          type: string
+        branch:
+          type: string
+        commitSha:
+          type: string
+        triggerEvent:
+          $ref: '#/components/schemas/TriggerEvent'
+        createdAt:
+          type: string
+          format: date-time
+        startedAt:
+          type: [string, 'null']
+          format: date-time
+        finishedAt:
+          type: [string, 'null']
+          format: date-time
+        jobCounts:
+          type: object
+          description: Number of jobs per JobStatus (statuses with zero jobs are omitted).
+          additionalProperties:
+            type: integer
+          examples:
+            - succeeded: 4
+              running: 1
+              blocked: 2
+    Run:
+      $ref: '#/components/schemas/RunDetail'
+    RunDetail:
+      allOf:
+        - $ref: '#/components/schemas/RunSummary'
+        - type: object
+          required: [stages, criticalPath, excluded, jobs]
+          properties:
+            stages:
+              type: array
+              items:
+                type: string
+            criticalPath:
+              type: array
+              items:
+                type: string
+            excluded:
+              type: array
+              items:
+                $ref: '#/components/schemas/ExcludedJob'
+            jobs:
+              type: array
+              description: Ordered by level, stage index, creation time and key.
+              items:
+                $ref: '#/components/schemas/Job'
+    Job:
+      type: object
+      required:
+        [
+          id,
+          key,
+          jobRef,
+          name,
+          stage,
+          stageIndex,
+          level,
+          matrix,
+          needs,
+          when,
+          allowFailure,
+          status,
+          attempt,
+          retries,
+          exitCode,
+          failureReason,
+          queuedAt,
+          startedAt,
+          finishedAt,
+          steps,
+        ]
+      properties:
+        id:
+          type: string
+          format: uuid
+        key:
+          type: string
+        jobRef:
+          type: string
+          description: Job id from the YAML (shared by all matrix instances).
+        name:
+          type: string
+        stage:
+          type: string
+        stageIndex:
+          type: integer
+        level:
+          type: integer
+        matrix:
+          oneOf:
+            - type: 'null'
+            - $ref: '#/components/schemas/ScalarMap'
+        needs:
+          type: array
+          items:
+            type: string
+        when:
+          $ref: '#/components/schemas/JobWhen'
+        allowFailure:
+          type: boolean
+        status:
+          $ref: '#/components/schemas/JobStatus'
+        attempt:
+          type: integer
+          description: Attempts started so far (0 before the first lease).
+        retries:
+          type: integer
+        exitCode:
+          type: [integer, 'null']
+        failureReason:
+          type: [string, 'null']
+          examples: ["step 'run tests' failed", 'lease expired (runner lost)', 'job timeout']
+        queuedAt:
+          type: [string, 'null']
+          format: date-time
+        startedAt:
+          type: [string, 'null']
+          format: date-time
+        finishedAt:
+          type: [string, 'null']
+          format: date-time
+        steps:
+          type: array
+          items:
+            $ref: '#/components/schemas/Step'
+    Step:
+      type: object
+      required: [id, position, name, status, exitCode, startedAt, finishedAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        position:
+          type: integer
+        name:
+          type: string
+        status:
+          $ref: '#/components/schemas/StepStatus'
+        exitCode:
+          type: [integer, 'null']
+        startedAt:
+          type: [string, 'null']
+          format: date-time
+        finishedAt:
+          type: [string, 'null']
+          format: date-time
+    LogChunk:
+      type: object
+      required: [seq, attempt, stream, content, createdAt]
+      properties:
+        seq:
+          type: integer
+          minimum: 1
+        attempt:
+          type: integer
+        stream:
+          type: string
+          enum: [stdout, stderr, system]
+        content:
+          type: string
+          description: Raw text including ANSI SGR escapes; known secrets already replaced by `***`.
+        createdAt:
+          type: string
+          format: date-time
+
+    Branch:
+      type: object
+      properties:
+        name:
+          type: string
+        headSha:
+          type: string
+        updatedAt:
+          type: string
+          format: date-time
+    Commit:
+      type: object
+      properties:
+        sha:
+          type: string
+        message:
+          type: string
+        author:
+          type: string
+        committedAt:
+          type: string
+          format: date-time
+    PipelineFile:
+      type: object
+      properties:
+        ref:
+          type: string
+        sha:
+          type: string
+        path:
+          const: .railyard.yml
+        yaml:
+          type: string
+    SecretMetadata:
+      type: object
+      properties:
+        name:
+          type: string
+        scope:
+          type: string
+          enum: [organization, project, environment]
+        keyVersion:
+          type: integer
+        updatedAt:
+          type: string
+          format: date-time
+        updatedBy:
+          type: string
+          format: uuid
+    PutSecretRequest:
+      type: object
+      required: [value]
+      properties:
+        value:
+          type: string
+          minLength: 4
+          maxLength: 65536
+          writeOnly: true
+    Artifact:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        jobId:
+          type: string
+          format: uuid
+        name:
+          type: string
+        sizeBytes:
+          type: integer
+        sha256:
+          type: string
+        expiresAt:
+          type: string
+          format: date-time
+    Environment:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        requiredReviewers:
+          type: integer
+        allowedBranches:
+          type: array
+          items:
+            type: string
+    CreateEnvironmentRequest:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+          pattern: '^[A-Za-z][A-Za-z0-9_-]{0,62}$'
+        requiredReviewers:
+          type: integer
+          minimum: 0
+          default: 0
+        allowedBranches:
+          type: array
+          items:
+            type: string
+    Deployment:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        environment:
+          type: string
+        runId:
+          type: string
+          format: uuid
+        jobId:
+          type: string
+          format: uuid
+        commitSha:
+          type: string
+        status:
+          type: string
+          enum: [in_progress, succeeded, failed, rolled_back]
+        createdAt:
+          type: string
+          format: date-time
+    Approval:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        runId:
+          type: string
+          format: uuid
+        jobId:
+          type: string
+          format: uuid
+        environment:
+          type: string
+        status:
+          type: string
+          enum: [pending, approved, rejected]
+        requestedAt:
+          type: string
+          format: date-time
+    ApprovalDecisionRequest:
+      type: object
+      properties:
+        comment:
+          type: string
+          maxLength: 1000
+    Schedule:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        cron:
+          type: string
+          examples: ['0 3 * * 1-5']
+        timezone:
+          type: string
+          default: UTC
+        branch:
+          type: string
+        paused:
+          type: boolean
+        nextRunAt:
+          type: [string, 'null']
+          format: date-time
+    CreateScheduleRequest:
+      type: object
+      required: [cron, branch]
+      properties:
+        cron:
+          type: string
+        branch:
+          type: string
+        timezone:
+          type: string
+          default: UTC
+    Runner:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        hostname:
+          type: string
+        labels:
+          type: array
+          items:
+            type: string
+        version:
+          type: string
+        status:
+          type: string
+          enum: [online, offline]
+        lastHeartbeatAt:
+          type: string
+          format: date-time
+        currentJobId:
+          type: [string, 'null']
+          format: uuid
+    RegistrationToken:
+      type: object
+      properties:
+        token:
+          type: string
+        expiresAt:
+          type: string
+          format: date-time
+    QueueMetrics:
+      type: object
+      properties:
+        queuedJobs:
+          type: integer
+        runningJobs:
+          type: integer
+        waitSeconds:
+          $ref: '#/components/schemas/Percentiles'
+    ProjectMetrics:
+      type: object
+      properties:
+        runs:
+          type: integer
+        successRate:
+          type: number
+          minimum: 0
+          maximum: 1
+        durationSeconds:
+          $ref: '#/components/schemas/Percentiles'
+    Percentiles:
+      type: object
+      properties:
+        p50:
+          type: number
+        p90:
+          type: number
+        p99:
+          type: number
+    Member:
+      type: object
+      properties:
+        userId:
+          type: string
+          format: uuid
+        email:
+          type: string
+        name:
+          type: string
+        role:
+          $ref: '#/components/schemas/Role'
+        joinedAt:
+          type: string
+          format: date-time
+    InvitationRequest:
+      type: object
+      required: [email, role]
+      properties:
+        email:
+          type: string
+          format: email
+        role:
+          $ref: '#/components/schemas/Role'
+    Invitation:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        email:
+          type: string
+        role:
+          $ref: '#/components/schemas/Role'
+        expiresAt:
+          type: string
+          format: date-time
+    AuditLogEntry:
+      type: object
+      properties:
+        id:
+          type: integer
+        action:
+          type: string
+          examples:
+            [
+              auth.login,
+              auth.login_failed,
+              auth.registered,
+              auth.logout,
+              project.created,
+              run.created,
+            ]
+        actorUserId:
+          type: [string, 'null']
+          format: uuid
+        targetType:
+          type: [string, 'null']
+        targetId:
+          type: [string, 'null']
+        metadata:
+          type: object
+        requestId:
+          type: [string, 'null']
+        ip:
+          type: [string, 'null']
+        createdAt:
+          type: string
+          format: date-time
+    ApiToken:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        prefix:
+          type: string
+          description: First characters of the token, for identification.
+        lastUsedAt:
+          type: [string, 'null']
+          format: date-time
+        expiresAt:
+          type: [string, 'null']
+          format: date-time
+    CreateApiTokenRequest:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+          maxLength: 100
+        expiresInDays:
+          type: integer
+          minimum: 1
+          maximum: 365
+    Notification:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        kind:
+          type: string
+          enum: [run_failed, approval_requested, queue_slo_breached]
+        runId:
+          type: [string, 'null']
+          format: uuid
+        read:
+          type: boolean
+        createdAt:
+          type: string
+          format: date-time

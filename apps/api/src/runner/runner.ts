@@ -26,6 +26,7 @@ import {
 
 export const RUNNER_VERSION = '0.1.0';
 const REAP_EVERY_MS = 10_000;
+const PRESENCE_EVERY_MS = 15_000;
 
 export interface RunnerOptions {
   readonly pool: Pool;
@@ -52,6 +53,7 @@ export class Runner {
   readonly name: string;
   private stopping = false;
   private lastReap = 0;
+  private lastPresence = 0;
   private loop: Promise<void> | null = null;
 
   constructor(private readonly opts: RunnerOptions) {
@@ -93,6 +95,11 @@ export class Runner {
 
   /** One iteration: reap if due, then lease and execute at most one job. Returns true if a job ran. */
   async runOnce(): Promise<boolean> {
+    if (Date.now() - this.lastPresence > PRESENCE_EVERY_MS) {
+      // Keeps runners.last_heartbeat_at fresh so /api/ready counts idle runners as online.
+      this.lastPresence = Date.now();
+      await markRunner(this.opts.pool, this.name, 'online');
+    }
     if (Date.now() - this.lastReap > REAP_EVERY_MS) {
       this.lastReap = Date.now();
       const reaped = await reapExpiredLeases(this.opts.pool);
@@ -174,6 +181,7 @@ export class Runner {
         await markStepFinished(
           this.opts.pool,
           step.id,
+          this.name,
           signal.aborted ? 'cancelled' : 'skipped',
           null,
         );
@@ -194,10 +202,12 @@ export class Runner {
   ): Promise<JobOutcome> {
     const remaining = deadline - Date.now();
     if (remaining <= 0) {
-      await markStepFinished(this.opts.pool, step.id, 'skipped', null);
+      await markStepFinished(this.opts.pool, step.id, this.name, 'skipped', null);
       return { result: 'timed_out', exitCode: null, reason: 'job timeout' };
     }
-    await markStepStarted(this.opts.pool, step.id);
+    if (!(await markStepStarted(this.opts.pool, step.id, this.name))) {
+      return { result: 'cancelled', exitCode: null, reason: 'lease lost' };
+    }
     writer.system(`$ ${step.name}`);
     const stepTimeoutMs = step.timeoutSeconds * 1000;
     const jobLimited = remaining < stepTimeoutMs;
@@ -209,7 +219,7 @@ export class Runner {
       onOutput: (stream, text) => writer.write(stream, text),
       signal,
     });
-    await markStepFinished(this.opts.pool, step.id, exec.result, exec.exitCode);
+    await markStepFinished(this.opts.pool, step.id, this.name, exec.result, exec.exitCode);
     writer.system(
       `[railyard] step '${step.name}' ${exec.result} (exit ${exec.exitCode ?? '-'}, ${exec.durationMs} ms)`,
     );

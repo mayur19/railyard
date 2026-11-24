@@ -320,3 +320,60 @@ jobs:
     expect(status.rows[0].status).toBe('offline');
   });
 });
+
+describe('lease fencing', () => {
+  it('ignores step updates from a runner that no longer holds the lease', async () => {
+    const { markStepFinished, markStepStarted } = await import('../src/runner/lease.js');
+    await startRun(`name: fenced
+jobs:
+  only:
+    steps: [echo hi]
+`);
+    const job = await leaseNextJob(pool, 'holder', 30);
+    const stepId = job?.steps[0]?.id as string;
+    expect(await markStepStarted(pool, stepId, 'intruder')).toBe(false);
+    expect(await markStepStarted(pool, stepId, 'holder')).toBe(true);
+    expect(await markStepFinished(pool, stepId, 'intruder', 'failed', 1)).toBe(false);
+    const step = await pool.query('SELECT status FROM job_steps WHERE id = $1', [stepId]);
+    expect(step.rows[0].status).toBe('running');
+  });
+
+  it('keeps logging when a flush fails and retries the batch', async () => {
+    const { LogWriter } = await import('../src/runner/log-writer.js');
+    await startRun(`name: flaky-db
+jobs:
+  only:
+    steps: [echo hi]
+`);
+    const job = await leaseNextJob(pool, 'writer', 30);
+    const errors: unknown[] = [];
+    let fail = true;
+    const flakyPool = {
+      query: (...args: Parameters<Pool['query']>) => {
+        if (fail && String(args[0]).includes('INSERT INTO job_log_chunks')) {
+          fail = false;
+          return Promise.reject(new Error('connection reset'));
+        }
+        return (pool.query as (...a: unknown[]) => unknown)(...args);
+      },
+    } as unknown as Pool;
+    const writer = new LogWriter({
+      pool: flakyPool,
+      jobId: job?.id as string,
+      attempt: 1,
+      firstSeq: 1,
+      onError: (e) => errors.push(e),
+      flushIntervalMs: 10_000,
+    });
+    writer.write('stdout', 'first\n');
+    await writer.flush();
+    writer.write('stdout', 'second\n');
+    await writer.close();
+    expect(errors).toHaveLength(1);
+    const rows = await pool.query(
+      'SELECT seq, content FROM job_log_chunks WHERE job_id = $1 ORDER BY seq',
+      [job?.id],
+    );
+    expect(rows.rows).toEqual([{ seq: 1, content: 'first\nsecond\n' }]);
+  });
+});

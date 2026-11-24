@@ -6,6 +6,7 @@ import {
   instanceKey,
   instanceName,
   matches,
+  matrixUpperBound,
 } from '../src/pipeline/matrix.js';
 
 describe('cartesian', () => {
@@ -90,6 +91,13 @@ describe('expandMatrix', () => {
   it('matches with string coercion', () => {
     expect(matches({ node: 20 }, { node: '20' })).toBe(true);
     expect(matches({ node: 20 }, { os: 'linux' })).toBe(false);
+  });
+
+  it('bounds combinations arithmetically', () => {
+    expect(
+      matrixUpperBound({ axes: { a: [1, 2, 3], b: [1, 2] }, include: [{ a: 9 }], exclude: [] }),
+    ).toBe(7);
+    expect(matrixUpperBound({ axes: {}, include: [{ a: 1 }], exclude: [] })).toBe(1);
   });
 
   it('counts combinations', () => {

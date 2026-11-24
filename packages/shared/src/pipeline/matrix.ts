@@ -66,6 +66,19 @@ export function expandMatrix(matrix: MatrixSpec): Combination[] {
     .map((slot) => slot.merged);
 }
 
+/**
+ * Upper bound on the expansion size without materialising anything: product of axis sizes plus
+ * one per include entry. O(axes). Used to reject hostile matrices before expanding them.
+ */
+export function matrixUpperBound(matrix: MatrixSpec): number {
+  const lengths = Object.values(matrix.axes).map((values) => values.length);
+  const product =
+    lengths.length === 0
+      ? 0
+      : lengths.reduce((acc, n) => Math.min(acc * n, Number.MAX_SAFE_INTEGER), 1);
+  return product + matrix.include.length;
+}
+
 /** Number of combinations the matrix expands to, without materialising more than needed. */
 export function countCombinations(matrix: MatrixSpec): number {
   return expandMatrix(matrix).length;

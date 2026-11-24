@@ -5,7 +5,7 @@ import { collectReferences, ExpressionError, parseExpression, type Expr } from '
 import { parseTemplate } from './interpolate.js';
 import { checkKeys, IssueCollector, isRecord, type PathPart } from './issues.js';
 import { IDENTIFIER_PATTERN, PIPELINE_LIMITS } from './limits.js';
-import { countCombinations } from './matrix.js';
+import { countCombinations, matrixUpperBound } from './matrix.js';
 import type {
   JobSpec,
   PipelineIssue,
@@ -197,13 +197,23 @@ function checkNeeds(
 
 function checkMatrixSize(issues: IssueCollector, job: JobSpec): void {
   if (!job.matrix) return;
+  const path = ['jobs', job.id, 'matrix'];
+  // Bound the size arithmetically first so hostile input never materialises a huge product.
+  const upperBound = matrixUpperBound(job.matrix);
+  if (upperBound > PIPELINE_LIMITS.maxMatrixCombinations * 16) {
+    issues.error(
+      'matrix_too_large',
+      path,
+      `matrix expands to up to ${upperBound} combinations (limit ${PIPELINE_LIMITS.maxMatrixCombinations})`,
+    );
+    return;
+  }
   const count = countCombinations(job.matrix);
-  if (count === 0)
-    issues.error('empty_matrix', ['jobs', job.id, 'matrix'], 'matrix excludes every combination');
+  if (count === 0) issues.error('empty_matrix', path, 'matrix excludes every combination');
   if (count > PIPELINE_LIMITS.maxMatrixCombinations) {
     issues.error(
       'matrix_too_large',
-      ['jobs', job.id, 'matrix'],
+      path,
       `matrix expands to ${count} combinations (limit ${PIPELINE_LIMITS.maxMatrixCombinations})`,
     );
   }

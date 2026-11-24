@@ -128,21 +128,35 @@ export async function reapExpiredLeases(pool: Pool, limit = 100): Promise<number
   return reaped;
 }
 
-export async function markStepStarted(db: Queryable, stepId: string): Promise<void> {
-  await db.query(
-    `UPDATE job_steps SET status = 'running', started_at = clock_timestamp() WHERE id = $1`,
-    [stepId],
+/**
+ * Step updates are fenced by the lease: they only apply while `owner` still holds the running
+ * job, so a runner that lost its lease cannot overwrite steps of a requeued attempt.
+ * Returns false when the lease is no longer held.
+ */
+export async function markStepStarted(
+  db: Queryable,
+  stepId: string,
+  owner: string,
+): Promise<boolean> {
+  const result = await db.query(
+    `UPDATE job_steps s SET status = 'running', started_at = clock_timestamp()
+     FROM jobs j WHERE s.id = $1 AND j.id = s.job_id AND j.lease_owner = $2 AND j.status = 'running'`,
+    [stepId, owner],
   );
+  return (result.rowCount ?? 0) === 1;
 }
 
 export async function markStepFinished(
   db: Queryable,
   stepId: string,
+  owner: string,
   status: 'succeeded' | 'failed' | 'timed_out' | 'skipped' | 'cancelled',
   exitCode: number | null,
-): Promise<void> {
-  await db.query(
-    `UPDATE job_steps SET status = $2, exit_code = $3, finished_at = clock_timestamp() WHERE id = $1`,
-    [stepId, status, exitCode],
+): Promise<boolean> {
+  const result = await db.query(
+    `UPDATE job_steps s SET status = $3, exit_code = $4, finished_at = clock_timestamp()
+     FROM jobs j WHERE s.id = $1 AND j.id = s.job_id AND j.lease_owner = $2 AND j.status = 'running'`,
+    [stepId, owner, status, exitCode],
   );
+  return (result.rowCount ?? 0) === 1;
 }

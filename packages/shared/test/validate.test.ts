@@ -227,6 +227,19 @@ describe('validatePipelineYaml - matrix', () => {
     );
   });
 
+  it('rejects huge matrices without expanding them', () => {
+    const values = Array.from({ length: 64 }, (_, i) => i).join(', ');
+    const axes = ['a', 'b', 'c', 'd', 'e', 'f']
+      .map((axis) => `      ${axis}: [${values}]`)
+      .join('\n');
+    const started = Date.now();
+    const issue = errorsOf(job(`    matrix:\n${axes}\n    steps: [x]\n`)).find(
+      (i) => i.code === 'matrix_too_large',
+    );
+    expect(issue?.message).toMatch(/up to 68719476736 combinations/);
+    expect(Date.now() - started).toBeLessThan(1000);
+  });
+
   it('rejects too many axes and values', () => {
     const axes = Array.from({ length: 9 }, (_, i) => `      a${i}: [1]`).join('\n');
     expect(codes(job(`    matrix:\n${axes}\n    steps: [x]\n`))).toContain('too_many');

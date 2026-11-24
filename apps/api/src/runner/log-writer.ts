@@ -12,6 +12,8 @@ export interface LogWriterOptions {
   readonly flushIntervalMs?: number;
   readonly maxBufferedBytes?: number;
   readonly maxTotalBytes?: number;
+  /** Called when persisting a batch fails; the batch is kept and retried on the next flush. */
+  readonly onError?: (err: unknown) => void;
 }
 
 interface Pending {
@@ -73,8 +75,11 @@ export class LogWriter {
     this.bufferedBytes += content.length;
   }
 
+  /** Never rejects: timer-driven flushes must not surface as unhandled rejections. */
   flush(): Promise<void> {
-    this.flushing = this.flushing.then(() => this.persist());
+    this.flushing = this.flushing
+      .then(() => this.persist())
+      .catch((err: unknown) => this.opts.onError?.(err));
     return this.flushing;
   }
 
@@ -83,12 +88,21 @@ export class LogWriter {
     const batch = this.buffer;
     this.buffer = [];
     this.bufferedBytes = 0;
-    const chunks = batch.map((item) => ({
-      seq: this.nextSeq++,
+    const firstSeq = this.nextSeq;
+    const chunks = batch.map((item, index) => ({
+      seq: firstSeq + index,
       attempt: this.opts.attempt,
       ...item,
     }));
-    await insertChunks(this.opts.pool, this.opts.jobId, chunks);
+    try {
+      await insertChunks(this.opts.pool, this.opts.jobId, chunks);
+    } catch (err) {
+      // Put the batch back in front of anything written meanwhile; sequence numbers are reused.
+      this.buffer = [...batch, ...this.buffer];
+      this.bufferedBytes += batch.reduce((n, item) => n + item.content.length, 0);
+      throw err;
+    }
+    this.nextSeq = firstSeq + chunks.length;
     await notifyLog(this.opts.pool, {
       jobId: this.opts.jobId,
       seq: (chunks[chunks.length - 1] as { seq: number }).seq,
